@@ -1,0 +1,9 @@
+/target
+/data
+.env
+.json
+.txt
+.ods
+.csv
+/llama/*.gguf
+
