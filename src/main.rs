@@ -52,8 +52,6 @@ impl Contact {
 async fn main() {
     let mut companies = load_companies("data/firm_leads_clean.json").expect("err opening file");
 
-    let company = &companies[0];
-
     println!("building llama");
 
     let model = GgufModelBuilder::new("llama/", vec!["Meta-Llama-3.1-8B-Instruct-Q8_0.gguf"])
@@ -63,24 +61,56 @@ async fn main() {
         .await
         .unwrap();
 
-    let test_page = fetch_page("https://fig1patents.com/team/scott-chapple").await;
-    let nodes = find_mailto_links(&test_page);
-    println!("nodes: {:?}", nodes);
+    for (ind, company) in companies.iter().enumerate() {
+        if ind != 1 {
+            continue;
+        }
+        if let Some(website) = &company.website {
+            let mut visited: HashSet<String> = HashSet::new();
+            let page = fetch_page(&website).await;
+            let mut links = parse_page_for_team_links(&page, website).await;
+            println!("{:?}", links);
 
-    let mut contacts: Vec<Contact> = vec![];
-
-    for node in nodes.iter() {
-        if let Some(email) = parse_email(node) {
-            println!("{}", email);
-            let context = extract_parent_content(node, 10);
-            let response = extract_contact_with_llm(&model, context, &email).await;
-            if let Some(contact) = parse_llm_reponse(response, &email) {
-                contacts.push(contact)
+            let mut contacts: Vec<Contact> = vec![];
+            let mut queue: VecDeque<String> = VecDeque::new();
+            for link in links.drain() {
+                let full_link = if link.starts_with("http://") || link.starts_with("https://") {
+                    link
+                } else {
+                    format!("{}{}", website.trim_end_matches('/'), link)
+                };
+                queue.push_back(full_link);
             }
+
+            while let Some(link) = queue.pop_front() {
+                println!("Processing link: {}", link);
+                if !visited.contains(&link) {
+                    let new_page = fetch_page(&link).await;
+                    let new_links = parse_page_for_team_links(&new_page, website).await;
+                    for new_link in new_links {
+                        if !visited.contains(&new_link) {
+                            queue.push_back(new_link);
+                        }
+                    }
+                    let nodes = find_mailto_links(&new_page);
+                    println!("nodes: {:?}", nodes);
+
+                    for node in nodes.iter() {
+                        if let Some(email) = parse_email(node) {
+                            println!("{}", email);
+                            let context = extract_parent_content(node, 10);
+                            let response = extract_contact_with_llm(&model, context, &email).await;
+                            if let Some(contact) = parse_llm_reponse(response, &email) {
+                                contacts.push(contact)
+                            }
+                        }
+                    }
+                    visited.insert(link);
+                }
+            }
+            println!("{:?}", contacts);
         }
     }
-
-    println!("{:?}", contacts);
 }
 
 fn parse_email(node: &ElementRef<'_>) -> Option<String> {
@@ -226,7 +256,7 @@ async fn craw_website(company: &Company) {
     if let Some(website) = &company.website {
         let mut visited: HashSet<String> = HashSet::new();
         let page = fetch_page(&website).await;
-        let mut links = parse_page_for_team_links(&page).await;
+        let mut links = parse_page_for_team_links(&page, website).await;
         println!("{:?}", links);
 
         let mut queue: VecDeque<String> = VecDeque::new();
@@ -238,7 +268,7 @@ async fn craw_website(company: &Company) {
             println!("Processing link: {}", link);
             if !visited.contains(&link) {
                 let new_page = fetch_page(&link).await;
-                let new_links = parse_page_for_team_links(&new_page).await;
+                let new_links = parse_page_for_team_links(&new_page, website).await;
                 for new_link in new_links {
                     if !visited.contains(&new_link) {
                         queue.push_back(new_link);
@@ -262,7 +292,7 @@ async fn fetch_page(link: &str) -> Html {
     Html::parse_document(&site)
 }
 
-async fn parse_page_for_team_links(page: &Html) -> HashSet<String> {
+async fn parse_page_for_team_links(page: &Html, url: &String) -> HashSet<String> {
     let keywords = [
         "team",
         "people",
@@ -271,14 +301,19 @@ async fn parse_page_for_team_links(page: &Html) -> HashSet<String> {
         "attorney",
         "staff",
         "associates",
+        "our-firm",
     ];
     let mut res: HashSet<String> = HashSet::new();
     let selector = Selector::parse("a").unwrap();
     for element in page.select(&selector) {
         if let Some(href) = element.value().attr("href") {
-            println!("Link found: {}", href);
             if keywords.iter().any(|word| href.contains(word)) {
-                res.insert(href.to_owned());
+                let full_link = if href.starts_with("http://") || href.starts_with("https://") {
+                    href
+                } else {
+                    &format!("{}{}", url.trim_end_matches('/'), href).to_string()
+                };
+                res.insert(full_link.to_owned());
             }
         }
     }
