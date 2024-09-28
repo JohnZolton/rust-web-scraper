@@ -4,13 +4,14 @@ use mistralrs::{
 use rand::seq::SliceRandom;
 use regex::Regex;
 use reqwest::header::Keys;
+use reqwest::{Client, Response};
 use scraper::node::Element;
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::CommandArgs;
 use std::string;
@@ -19,7 +20,7 @@ use std::thread::current;
 use std::time::Duration;
 use urlencoding::encode;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Company {
     rank: String,
     name: String,
@@ -28,7 +29,7 @@ struct Company {
     website: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Contact {
     name: Option<String>,
     title: Option<String>,
@@ -52,21 +53,34 @@ impl Contact {
 async fn main() {
     let mut companies = load_companies("data/firm_leads_clean.json").expect("err opening file");
 
-    println!("building llama");
+    let file_path = "data/firm_leads_clean_2.json";
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true) // Clear file first to start fresh
+        .open(file_path)
+        .expect("Failed to create file");
 
-    let model = GgufModelBuilder::new("llama/", vec!["Meta-Llama-3.1-8B-Instruct-Q8_0.gguf"])
-        .with_chat_template("llama/tokenizer_config.json")
-        .with_logging()
-        .build()
-        .await
-        .unwrap();
+    file.write_all(b"[\n")
+        .expect("Failed to write opening bracket");
 
-    for (ind, company) in companies.iter().enumerate() {
-        if ind != 1 {
-            continue;
-        }
+    let test_email = "testing@fake.com";
+    let fake_context = "llama.context_length: 131072
+llama.embedding_length: 4096
+llama.feed_forward_length: 14336
+llama.rope.dimension_count: 128
+llama.rope.freq_base: 500000
+";
+    let ans = extract_contact_with_llm(fake_context.to_string(), &test_email.to_string()).await;
+    println!("{}", ans);
+
+    for (i, company) in companies.iter_mut().enumerate() {
         if let Some(website) = &company.website {
+            if company.personnel.is_some() {
+                continue;
+            }
             let mut visited: HashSet<String> = HashSet::new();
+            let mut logged_emails: HashSet<String> = HashSet::new();
             let page = fetch_page(&website).await;
             let mut links = parse_page_for_team_links(&page, website).await;
             println!("{:?}", links);
@@ -98,19 +112,37 @@ async fn main() {
                     for node in nodes.iter() {
                         if let Some(email) = parse_email(node) {
                             println!("{}", email);
+                            if logged_emails.contains(&email) {
+                                continue;
+                            }
                             let context = extract_parent_content(node, 10);
-                            let response = extract_contact_with_llm(&model, context, &email).await;
+                            let response = extract_contact_with_llm(context, &email).await;
                             if let Some(contact) = parse_llm_reponse(response, &email) {
                                 contacts.push(contact)
                             }
+                            logged_emails.insert(email);
                         }
                     }
                     visited.insert(link);
                 }
             }
-            println!("{:?}", contacts);
+            println!("{:?}", &contacts);
+            company.personnel = Some(contacts);
+
+            let json = serde_json::to_string_pretty(&company).expect("err making json");
+
+            if i > 0 {
+                file.write_all(b",\n").expect("Failed to write separator");
+            }
+            file.write_all(json.as_bytes());
+
+            println!("Updated data written to file for company: {}", company.name);
         }
     }
+    // End the JSON array
+    file.write_all(b"\n]")
+        .expect("Failed to write closing bracket");
+    file.flush().expect("Failed to flush file");
 }
 
 fn parse_email(node: &ElementRef<'_>) -> Option<String> {
@@ -122,31 +154,51 @@ fn parse_email(node: &ElementRef<'_>) -> Option<String> {
     return None;
 }
 
-async fn extract_contact_with_llm(
-    model: &Model,
-    context: String,
-    email: &String,
-) -> ChatCompletionResponse {
+async fn extract_contact_with_llm(context: String, email: &String) -> String {
     let user_prompt = format!(
-        "<|user|>Extract the contact information for this email: {} from this snippet: {}</s>",
+        "Extract the contact information for this email: {} from this snippet: {}",
         email, context
     );
-    let sys_prompt = "<|system|>You are a stellar web scraping api. you determine if a name and title are present that match a given email. you always return results in <name></name> and <title></title> tags that have a persons name and job title/position. if None are found, you return NONE</s>".to_string();
+    let sys_prompt = "You are a stellar web scraping api. you determine if a name and title are present that match a given email. you always return results in <name></name> and <title></title> tags that have a persons name and job title/position. if None are found, you return NONE".to_string();
 
-    let request = RequestBuilder::new()
-        //.set_constraint(mistralrs::Constraint::Regex(r"(<name>)(.+?)(<\/name>\n)(<title>)(.+?)(<\/title>)\/gm".to_string(),))
-        .add_message(TextMessageRole::System, sys_prompt.clone())
-        .add_message(TextMessageRole::User, user_prompt.clone());
+    let client = Client::new();
 
-    let response = model.send_chat_request(request).await.unwrap();
-    let text = response.choices[0].message.content.as_ref().unwrap();
-    println!("{}", &text);
+    let json_body = serde_json::json!({
+        "messages":
+        [
+            {
+        "role": "system",
+        "content": sys_prompt
+            },
+            {
+        "role": "user",
+        "content": user_prompt
 
-    response
+            }
+        ],
+    }
+    );
+
+    let response = client
+        .post("http://127.0.0.1:5000/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .body(serde_json::to_string(&json_body).expect("err making json"))
+        .send()
+        .await
+        .expect("err making api call");
+    println!("{:?}", response);
+
+    let json: Value = response.json().await.expect("err parsing json");
+    println!("{:?}", json);
+    let text = json["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("err parsing response");
+    println!("{:?}", &text);
+
+    text.to_string()
 }
 
-fn parse_llm_reponse(response: ChatCompletionResponse, email: &String) -> Option<Contact> {
-    let text = response.choices[0].message.content.clone().unwrap();
+fn parse_llm_reponse(text: String, email: &String) -> Option<Contact> {
     println!("{}", &text);
     let name_regex = Regex::new(r"<name>(.+?)</name>").unwrap();
     let title_regex = Regex::new(r"<title>(.+?)</title>").unwrap();
