@@ -1,6 +1,3 @@
-use mistralrs::{
-    ChatCompletionResponse, GgufModelBuilder, Model, RequestBuilder, TextMessageRole, TextMessages,
-};
 use rand::seq::SliceRandom;
 use regex::Regex;
 use reqwest::header::Keys;
