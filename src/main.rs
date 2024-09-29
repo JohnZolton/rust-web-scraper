@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::CommandArgs;
 use std::string;
@@ -61,12 +61,21 @@ async fn main() {
         .await
         .unwrap();
 
-    for (ind, company) in companies.iter().enumerate() {
-        if ind != 1 {
-            continue;
-        }
+    let file_path = "data/firm_leads_clean_2.json";
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true) // Clear file first to start fresh
+        .open(file_path)
+        .expect("Failed to create file");
+
+    file.write_all(b"[\n")
+        .expect("Failed to write opening bracket");
+
+    for (ind, company) in companies.iter_mut().enumerate() {
         if let Some(website) = &company.website {
             let mut visited: HashSet<String> = HashSet::new();
+            let mut loggged_emails: HashSet<String> = HashSet::new();
             let page = fetch_page(&website).await;
             let mut links = parse_page_for_team_links(&page, website).await;
             println!("{:?}", links);
@@ -81,10 +90,16 @@ async fn main() {
                 };
                 queue.push_back(full_link);
             }
+            let mut count = 1;
 
             while let Some(link) = queue.pop_front() {
                 println!("Processing link: {}", link);
                 if !visited.contains(&link) {
+                    if !link.starts_with(website) {
+                        continue;
+                    }
+                    println!("Company {}: link {}", ind, count);
+                    count += 1;
                     let new_page = fetch_page(&link).await;
                     let new_links = parse_page_for_team_links(&new_page, website).await;
                     for new_link in new_links {
@@ -93,23 +108,36 @@ async fn main() {
                         }
                     }
                     let nodes = find_mailto_links(&new_page);
-                    println!("nodes: {:?}", nodes);
 
                     for node in nodes.iter() {
                         if let Some(email) = parse_email(node) {
-                            println!("{}", email);
-                            let context = extract_parent_content(node, 10);
+                            if loggged_emails.contains(&email) {
+                                continue;
+                            }
+                            let context = extract_parent_content(node, 1000);
                             let response = extract_contact_with_llm(&model, context, &email).await;
                             if let Some(contact) = parse_llm_reponse(response, &email) {
                                 contacts.push(contact)
                             }
+                            loggged_emails.insert(email);
                         }
                     }
                     visited.insert(link);
                 }
             }
             println!("{:?}", contacts);
+            company.personnel = Some(contacts);
+            let json = serde_json::to_string_pretty(&company).expect("err making json");
+            if ind > 0 {
+                file.write_all(b",\n").expect("failed to write separator");
+            }
+            file.write_all(json.as_bytes())
+                .expect("failed to write contacts");
+            println!("Updated data written to file for company: {}", company.name);
         }
+        file.write_all(b"\n")
+            .expect("failed to write closing bracket");
+        file.flush().expect("failed to flush file")
     }
 }
 
@@ -127,6 +155,11 @@ async fn extract_contact_with_llm(
     context: String,
     email: &String,
 ) -> ChatCompletionResponse {
+    let context = if context.len() > 2000 {
+        context.chars().take(2000).collect::<String>()
+    } else {
+        context
+    };
     let user_prompt = format!(
         "<|user|>Extract the contact information for this email: {} from this snippet: {}</s>",
         email, context
@@ -140,14 +173,18 @@ async fn extract_contact_with_llm(
 
     let response = model.send_chat_request(request).await.unwrap();
     let text = response.choices[0].message.content.as_ref().unwrap();
-    println!("{}", &text);
+
+    dbg!(
+        response.usage.prompt_tokens,
+        response.usage.completion_tokens,
+        response.usage.total_time_sec
+    );
 
     response
 }
 
 fn parse_llm_reponse(response: ChatCompletionResponse, email: &String) -> Option<Contact> {
     let text = response.choices[0].message.content.clone().unwrap();
-    println!("{}", &text);
     let name_regex = Regex::new(r"<name>(.+?)</name>").unwrap();
     let title_regex = Regex::new(r"<title>(.+?)</title>").unwrap();
     let none_regex = Regex::new(r"none").unwrap();
@@ -167,8 +204,11 @@ fn parse_llm_reponse(response: ChatCompletionResponse, email: &String) -> Option
     Some(contact)
 }
 
-fn collect_text_recursive(node: ElementRef<'_>, context: &mut String) {
+fn collect_text_recursive(node: ElementRef<'_>, context: &mut String, max_context_length: usize) {
     for child in node.children() {
+        if context.len() >= max_context_length {
+            break;
+        }
         match child.value() {
             Node::Text(text_node) => {
                 //HEURISTIC: we only want position/title, avoid long paragraphs
@@ -178,37 +218,29 @@ fn collect_text_recursive(node: ElementRef<'_>, context: &mut String) {
                 }
             }
             Node::Element(element) => {
-                //context.push_str(&format!("<{}>", element.name()));
                 if let Some(child_ref) = ElementRef::wrap(child) {
-                    collect_text_recursive(child_ref, context);
+                    collect_text_recursive(child_ref, context, max_context_length);
                 }
-                //context.push_str(&format!("<{}>", element.name()));
             }
             _ => {}
         }
     }
 }
 
-fn extract_parent_content(node: &ElementRef<'_>, depth: usize) -> String {
-    let mut current = node.parent();
-    let mut depth_counter = 0;
+fn extract_parent_content(node: &ElementRef<'_>, max_context_length: usize) -> String {
+    let mut context = String::new();
+    let mut current = Some(*node);
 
     //climb out
-    while let Some(parent) = current {
-        if depth_counter == depth {
+    while let Some(element) = current {
+        if context.len() == max_context_length {
             break;
         }
-        current = parent.parent();
-        depth_counter += 1
+        collect_text_recursive(element, &mut context, max_context_length);
+        current = element.parent().and_then(ElementRef::wrap);
     }
+    println!("CONTEXT: {}", context);
 
-    //collect context
-    let mut context = String::new();
-    if let Some(parent) = current {
-        if let Some(node) = ElementRef::wrap(parent) {
-            collect_text_recursive(node, &mut context)
-        }
-    }
     context
 }
 
