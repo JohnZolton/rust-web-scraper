@@ -218,8 +218,10 @@ fn collect_text_recursive(node: ElementRef<'_>, context: &mut String, max_contex
                 }
             }
             Node::Element(element) => {
-                if element.name() != "a" {
-                    // Skip <a> tags
+                if !matches!(
+                    element.name(),
+                    "a" | "script" | "style" | "noscript" | "svg" | "path"
+                ) {
                     if let Some(child_ref) = ElementRef::wrap(child) {
                         collect_text_recursive(child_ref, context, max_context_length);
                     }
