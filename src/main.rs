@@ -218,8 +218,11 @@ fn collect_text_recursive(node: ElementRef<'_>, context: &mut String, max_contex
                 }
             }
             Node::Element(element) => {
-                if let Some(child_ref) = ElementRef::wrap(child) {
-                    collect_text_recursive(child_ref, context, max_context_length);
+                if element.name() != "a" {
+                    // Skip <a> tags
+                    if let Some(child_ref) = ElementRef::wrap(child) {
+                        collect_text_recursive(child_ref, context, max_context_length);
+                    }
                 }
             }
             _ => {}
@@ -230,15 +233,23 @@ fn collect_text_recursive(node: ElementRef<'_>, context: &mut String, max_contex
 fn extract_parent_content(node: &ElementRef<'_>, max_context_length: usize) -> String {
     let mut context = String::new();
     let mut current = Some(*node);
+    let mut last_element = Some(node.clone());
+    let mut temp_context = String::new();
 
     //climb out
     while let Some(element) = current {
-        if context.len() == max_context_length {
+        if temp_context.len() == max_context_length {
             break;
         }
-        collect_text_recursive(element, &mut context, max_context_length);
+        last_element = Some(element.clone());
+        collect_text_recursive(element, &mut temp_context, max_context_length);
         current = element.parent().and_then(ElementRef::wrap);
     }
+    collect_text_recursive(
+        last_element.expect("err on element"),
+        &mut context,
+        max_context_length,
+    );
     println!("CONTEXT: {}", context);
 
     context
