@@ -73,6 +73,10 @@ async fn main() {
         .expect("Failed to write opening bracket");
 
     for (ind, company) in companies.iter_mut().enumerate() {
+        //skip completed companies
+        if company.personnel.is_some() {
+            continue;
+        }
         if let Some(website) = &company.website {
             let mut visited: HashSet<String> = HashSet::new();
             let mut loggged_emails: HashSet<String> = HashSet::new();
@@ -220,7 +224,7 @@ fn collect_text_recursive(node: ElementRef<'_>, context: &mut String, max_contex
             Node::Element(element) => {
                 if !matches!(
                     element.name(),
-                    "a" | "script" | "style" | "noscript" | "svg" | "path"
+                    "script" | "style" | "noscript" | "svg" | "path" | "form" | "nav"
                 ) {
                     if let Some(child_ref) = ElementRef::wrap(child) {
                         collect_text_recursive(child_ref, context, max_context_length);
